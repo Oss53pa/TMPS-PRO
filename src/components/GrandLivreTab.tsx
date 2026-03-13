@@ -11,14 +11,19 @@ interface GLEntry {
   id: string;
   date: string;
   journal: string;
+  compte: string;            // Compte unique (SYSCOHADA)
+  description: string;       // Description / intitulé du compte
+  analyticCode: string;      // Code analytique
   numeroPiece: string;
-  compteDebit: string;
-  compteCredit: string;
-  libelle: string;
-  debit: number;
-  credit: number;
+  libelle: string;           // Libellé écriture
+  debit: number;             // Mouvement débit
+  credit: number;            // Mouvement crédit
+  solde: number;             // Solde
   entity: string;
   imported: boolean;
+  // Legacy compat (mapped from compte)
+  compteDebit: string;
+  compteCredit: string;
 }
 
 interface ImportReport {
@@ -124,20 +129,44 @@ export default function GrandLivreTab({ rows, setRows, ccySym, stats, planCompta
 
       const fileHash = await computeFileHash(text);
       const parsed: GLEntry[] = [];
-      const existingPieces = new Set(entries.map(e => e.numeroPiece));
+      const existingPieces = new Set(entries.map(e => `${e.numeroPiece}|${e.compte}`));
       const errors: ImportReport["errors"] = [];
       let dupes = 0;
       let totalDebit = 0;
       let totalCredit = 0;
 
+      // Detect column format from header
+      const header = lines[0].split(";").map(h => h.trim().toLowerCase());
+      const isNewFormat = header.some(h => h.includes("analytic") || h === "compte" || h.includes("description"));
+
       for (let i = 1; i < lines.length; i++) {
         const cols = lines[i].split(";").map(c => c.trim());
-        if (cols.length < 8) {
-          errors.push({ line: i + 1, piece: "", motif: "Nombre de colonnes insuffisant (<8)" });
-          continue;
+
+        let date: string, journal: string, piece: string, compte: string,
+            description: string, analyticCode: string, libelle: string,
+            debitStr: string, creditStr: string, soldeStr: string, entity: string;
+
+        if (isNewFormat) {
+          // Format réel GL: DATE;Code Journal;Compte;Description;Analytic code;N° de pièce;Libellé écriture;Mouvement débit;Mouvement crédit;Solde
+          if (cols.length < 8) {
+            errors.push({ line: i + 1, piece: "", motif: "Nombre de colonnes insuffisant (<8)" });
+            continue;
+          }
+          [date, journal, compte, description, analyticCode, piece, libelle, debitStr, creditStr] = cols;
+          soldeStr = cols[9] || "0";
+          entity = cols[10] || "CI";
+        } else {
+          // Legacy format: Date;Journal;NumPiece;CompteDebit;CompteCredit;Libelle;Debit;Credit;Entite
+          if (cols.length < 8) {
+            errors.push({ line: i + 1, piece: "", motif: "Nombre de colonnes insuffisant (<8)" });
+            continue;
+          }
+          date = cols[0]; journal = cols[1]; piece = cols[2];
+          compte = cols[3] || cols[4]; // Use whichever account is populated
+          description = ""; analyticCode = "";
+          libelle = cols[5]; debitStr = cols[6]; creditStr = cols[7];
+          soldeStr = "0"; entity = cols[8] || "CI";
         }
-        const [date, journal, piece, cDebit, cCredit, libelle, debitStr, creditStr] = cols;
-        const entity = cols[8] || "CI";
 
         // Validation: N° pièce obligatoire
         if (!piece || !piece.trim()) {
@@ -145,9 +174,10 @@ export default function GrandLivreTab({ rows, setRows, ccySym, stats, planCompta
           continue;
         }
 
-        // Validation: doublon pièce
-        if (existingPieces.has(piece)) {
-          errors.push({ line: i + 1, piece, motif: "Pièce déjà enregistrée" });
+        // Validation: doublon pièce + compte (même pièce peut avoir plusieurs lignes sur comptes différents)
+        const dupeKey = `${piece}|${compte}`;
+        if (existingPieces.has(dupeKey)) {
+          errors.push({ line: i + 1, piece, motif: `Pièce ${piece} / Compte ${compte} déjà enregistré` });
           dupes++;
           continue;
         }
@@ -161,6 +191,7 @@ export default function GrandLivreTab({ rows, setRows, ccySym, stats, planCompta
         // Validation: montants
         const debitVal = p(debitStr);
         const creditVal = p(creditStr);
+        const soldeVal = p(soldeStr);
         if (debitVal < 0) {
           errors.push({ line: i + 1, piece, motif: `Débit négatif: ${debitStr}` });
           continue;
@@ -170,25 +201,27 @@ export default function GrandLivreTab({ rows, setRows, ccySym, stats, planCompta
           continue;
         }
 
-        // Validation: comptes SYSCOHADA (warning, non bloquant)
-        if (cDebit && !isValidCompte(cDebit)) {
-          errors.push({ line: i + 1, piece, motif: `Compte débit non reconnu: ${cDebit} (importé quand même)` });
-        }
-        if (cCredit && !isValidCompte(cCredit)) {
-          errors.push({ line: i + 1, piece, motif: `Compte crédit non reconnu: ${cCredit} (importé quand même)` });
+        // Validation: compte SYSCOHADA (warning, non bloquant)
+        if (compte && !isValidCompte(compte)) {
+          errors.push({ line: i + 1, piece, motif: `Compte non reconnu: ${compte} (importé quand même)` });
         }
 
         totalDebit += debitVal;
         totalCredit += creditVal;
 
         parsed.push({
-          id: uid(), date, journal, numeroPiece: piece,
-          compteDebit: cDebit, compteCredit: cCredit, libelle,
-          debit: debitVal, credit: creditVal, entity, imported: true,
+          id: uid(), date, journal, compte: compte || "",
+          description: description || "", analyticCode: analyticCode || "",
+          numeroPiece: piece, libelle,
+          debit: debitVal, credit: creditVal, solde: soldeVal,
+          // Map to legacy fields for Classe 5 compatibility
+          compteDebit: debitVal > 0 ? compte : "",
+          compteCredit: creditVal > 0 ? compte : "",
+          entity, imported: true,
         });
 
-        // Track piece to prevent intra-file duplicates
-        existingPieces.add(piece);
+        // Track piece+compte to prevent intra-file duplicates
+        existingPieces.add(dupeKey);
       }
 
       const balanced = Math.abs(totalDebit - totalCredit) < 0.01;
@@ -227,29 +260,129 @@ export default function GrandLivreTab({ rows, setRows, ccySym, stats, planCompta
     persist(entries.filter(e => e.id !== id));
   };
 
+  const [syncMsg, setSyncMsg] = useState("");
+
+  /** Synchronise GL entries → FlowRow lines for the whole app */
+  const syncToFlows = () => {
+    if (entries.length === 0) { setSyncMsg("Aucune ecriture a synchroniser."); return; }
+
+    // Parse month from date (DD/MM/YYYY or YYYY-MM-DD)
+    const getMonth = (d: string): number => {
+      if (!d) return 0;
+      if (d.includes("/")) { const parts = d.split("/"); return parseInt(parts[1]) - 1; }
+      if (d.includes("-")) { const parts = d.split("-"); return parseInt(parts[1]) - 1; }
+      return 0;
+    };
+
+    // Determine category from account classe
+    const getCat = (compte: string): "enc" | "dec" => {
+      const c1 = parseInt(compte[0]);
+      if (c1 === 7) return "enc"; // Produits
+      return "dec"; // Charges & others default to dec
+    };
+
+    // Determine IAS7 section from account classe
+    const getSection = (compte: string): "ope" | "inv" | "fin" => {
+      const c2 = compte.substring(0, 2);
+      // Classe 2 (immo) → investissement
+      if (compte[0] === "2") return "inv";
+      // Classe 16/17 (emprunts/dettes financières) → financement
+      if (c2 === "16" || c2 === "17" || c2 === "15") return "fin";
+      // Classe 5 (trésorerie) → opérationnel
+      return "ope";
+    };
+
+    // Group by: entity + account + determine enc/dec
+    // Aggregate monthly amounts
+    const groups: Record<string, {
+      entity: string; compte: string; libelle: string;
+      section: "ope" | "inv" | "fin"; cat: "enc" | "dec";
+      amounts: number[];
+    }> = {};
+
+    // Only sync Classe 6 (charges) and 7 (produits) — these are the P&L flows
+    // Classe 5 movements are treasury (already captured by bank balances)
+    entries.forEach(e => {
+      const cpt = e.compte || e.compteDebit || e.compteCredit;
+      if (!cpt) return;
+      const c1 = parseInt(cpt[0]);
+      // Only process P&L accounts (6=charges, 7=produits) and investment (2) / financing (16-17)
+      if (c1 !== 6 && c1 !== 7 && c1 !== 2) return;
+
+      const cat = getCat(cpt);
+      const key = `${e.entity}|${cpt}|${cat}`;
+      if (!groups[key]) {
+        groups[key] = {
+          entity: e.entity || "CI",
+          compte: cpt,
+          libelle: e.description || e.libelle || `Compte ${cpt}`,
+          section: getSection(cpt),
+          cat,
+          amounts: Array(12).fill(0),
+        };
+      }
+      const mi = getMonth(e.date);
+      if (mi >= 0 && mi < 12) {
+        // For enc (produits): use credit; for dec (charges): use debit
+        groups[key].amounts[mi] += cat === "enc" ? e.credit : e.debit;
+      }
+    });
+
+    const grouped = Object.values(groups).filter(g => g.amounts.some(a => a > 0));
+    if (grouped.length === 0) {
+      setSyncMsg("Aucun flux P&L (classes 6/7) trouve dans le GL.");
+      setTimeout(() => setSyncMsg(""), 5000);
+      return;
+    }
+
+    // Remove previously synced rows (marked by compteComptable starting with "GL:")
+    const existingNonGL = rows.filter(r => !r.compteComptable?.startsWith("GL:"));
+
+    // Create new FlowRows
+    const newFlowRows: FlowRow[] = grouped.map(g => ({
+      id: uid(),
+      entity: g.entity,
+      bank: BANKS[0] || "SGBCI",
+      section: g.section,
+      type: g.cat === "enc" ? "Autres produits opérationnels" : "Fournisseurs & prestataires",
+      cat: g.cat,
+      ccy: "XOF",
+      label: g.libelle,
+      amounts: g.amounts.map(a => a > 0 ? a.toString() : ""),
+      amountsReel: g.amounts.map(a => a > 0 ? a.toString() : ""), // GL = réalisé
+      note: "Synchronise depuis Grand Livre",
+      compteComptable: `GL:${g.compte}`,
+      scenario: "base",
+      statut: "realise",
+      recurrence: "ponctuel",
+      probabilite: 100,
+    }));
+
+    setRows(() => [...existingNonGL, ...newFlowRows]);
+    setSyncMsg(`${newFlowRows.length} ligne(s) de flux creees depuis ${entries.length} ecritures GL.`);
+    setTimeout(() => setSyncMsg(""), 8000);
+  };
+
   /* ── Classe 5 filtered ── */
   const classe5Entries = useMemo(() =>
     entries.filter(e =>
-      (isClasse5(e.compteDebit) || isClasse5(e.compteCredit)) &&
+      isClasse5(e.compte || e.compteDebit || e.compteCredit) &&
       (filterEntity === "ALL" || e.entity === filterEntity) &&
-      (!filterCompte || e.compteDebit.includes(filterCompte) || e.compteCredit.includes(filterCompte))
+      (!filterCompte || (e.compte || e.compteDebit || e.compteCredit).includes(filterCompte))
     ),
   [entries, filterEntity, filterCompte]);
 
   /* ── Classe 5 balance by compte ── */
   const classe5Balances = useMemo(() => {
-    const map: Record<string, { debit: number; credit: number; solde: number }> = {};
+    const map: Record<string, { debit: number; credit: number; solde: number; description: string }> = {};
     classe5Entries.forEach(e => {
-      if (isClasse5(e.compteDebit)) {
-        if (!map[e.compteDebit]) map[e.compteDebit] = { debit: 0, credit: 0, solde: 0 };
-        map[e.compteDebit].debit += e.debit;
-        map[e.compteDebit].solde += e.debit;
-      }
-      if (isClasse5(e.compteCredit)) {
-        if (!map[e.compteCredit]) map[e.compteCredit] = { debit: 0, credit: 0, solde: 0 };
-        map[e.compteCredit].credit += e.credit;
-        map[e.compteCredit].solde -= e.credit;
-      }
+      const cpt = e.compte || e.compteDebit || e.compteCredit;
+      if (!cpt || !isClasse5(cpt)) return;
+      if (!map[cpt]) map[cpt] = { debit: 0, credit: 0, solde: 0, description: e.description || "" };
+      map[cpt].debit += e.debit;
+      map[cpt].credit += e.credit;
+      map[cpt].solde += e.debit - e.credit;
+      if (!map[cpt].description && e.description) map[cpt].description = e.description;
     });
     return Object.entries(map).sort((a, b) => a[0].localeCompare(b[0]));
   }, [classe5Entries]);
@@ -280,9 +413,14 @@ export default function GrandLivreTab({ rows, setRows, ccySym, stats, planCompta
 
   /* ── Download GL Template ── */
   const downloadTemplate = () => {
-    const header = "Date;Journal;NumPiece;CompteDebit;CompteCredit;Libelle;Debit;Credit;Entite";
-    const sample = "2026-01-15;BQ;GL001;521000;411000;Encaissement client;1500000;0;CI";
-    const blob = new Blob([header + "\n" + sample + "\n"], { type: "text/csv" });
+    const header = "DATE;Code Journal;Compte;Description;Analytic code;N° de pièce;Libellé écriture;Mouvement débit;Mouvement crédit;Solde";
+    const samples = [
+      "15/01/2026;BQ;521000;Banques locales;ANG-CI;GL001;Encaissement loyer Angré;1500000;0;1500000",
+      "15/01/2026;BQ;411000;Clients;ANG-CI;GL001;Encaissement loyer Angré;0;1500000;-1500000",
+      "20/01/2026;OD;601000;Achats de matières;MAINT;GL002;Achat fournitures maintenance;0;350000;-350000",
+      "20/01/2026;OD;521000;Banques locales;MAINT;GL002;Achat fournitures maintenance;350000;0;350000",
+    ];
+    const blob = new Blob(["\uFEFF" + header + "\n" + samples.join("\n") + "\n"], { type: "text/csv;charset=utf-8;" });
     const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "template_grandlivre.csv"; a.click();
   };
 
@@ -323,13 +461,14 @@ export default function GrandLivreTab({ rows, setRows, ccySym, stats, planCompta
                   <tr className="bg-neutral-50 text-neutral-500 sticky top-0">
                     <th className="px-2 py-1.5 text-left font-medium">Date</th>
                     <th className="px-2 py-1.5 text-left font-medium">Journal</th>
+                    <th className="px-2 py-1.5 text-left font-medium">Compte</th>
+                    <th className="px-2 py-1.5 text-left font-medium">Description</th>
+                    <th className="px-2 py-1.5 text-left font-medium">Analytique</th>
                     <th className="px-2 py-1.5 text-left font-medium">N° Pièce</th>
-                    <th className="px-2 py-1.5 text-left font-medium">Débit</th>
-                    <th className="px-2 py-1.5 text-left font-medium">Crédit</th>
                     <th className="px-2 py-1.5 text-left font-medium">Libellé</th>
-                    <th className="px-2 py-1.5 text-right font-medium">Débit</th>
-                    <th className="px-2 py-1.5 text-right font-medium">Crédit</th>
-                    <th className="px-2 py-1.5 text-left font-medium">Entité</th>
+                    <th className="px-2 py-1.5 text-right font-medium">Mvt Débit</th>
+                    <th className="px-2 py-1.5 text-right font-medium">Mvt Crédit</th>
+                    <th className="px-2 py-1.5 text-right font-medium">Solde</th>
                     <th className="px-2 py-1.5 w-5"></th>
                   </tr>
                 </thead>
@@ -340,13 +479,14 @@ export default function GrandLivreTab({ rows, setRows, ccySym, stats, planCompta
                     <tr key={e.id} className="border-b border-neutral-100 hover:bg-neutral-50">
                       <td className="px-2 py-1 text-neutral-600">{e.date}</td>
                       <td className="px-2 py-1 font-medium">{e.journal}</td>
+                      <td className="px-2 py-1 font-mono text-neutral-800">{e.compte}</td>
+                      <td className="px-2 py-1 text-neutral-500 truncate max-w-[120px]">{e.description}</td>
+                      <td className="px-2 py-1 text-neutral-400 font-mono text-[10px]">{e.analyticCode}</td>
                       <td className="px-2 py-1 font-mono text-neutral-500">{e.numeroPiece}</td>
-                      <td className="px-2 py-1 font-mono">{e.compteDebit}</td>
-                      <td className="px-2 py-1 font-mono">{e.compteCredit}</td>
                       <td className="px-2 py-1 text-neutral-600 truncate max-w-[200px]">{e.libelle}</td>
                       <td className="px-2 py-1 text-right tabular-nums text-emerald-600 font-medium">{e.debit > 0 ? fmt(e.debit) : "—"}</td>
                       <td className="px-2 py-1 text-right tabular-nums text-rose-600 font-medium">{e.credit > 0 ? fmt(e.credit) : "—"}</td>
-                      <td className="px-2 py-1">{e.entity}</td>
+                      <td className={`px-2 py-1 text-right tabular-nums font-medium ${(e.solde || 0) >= 0 ? "text-neutral-700" : "text-rose-600"}`}>{e.solde ? fmt(e.solde) : "—"}</td>
                       <td className="px-1 py-1">
                         <button onClick={() => deleteEntry(e.id)} className="text-neutral-300 hover:text-red-500 font-bold transition">×</button>
                       </td>
@@ -398,20 +538,24 @@ export default function GrandLivreTab({ rows, setRows, ccySym, stats, planCompta
                       <thead>
                         <tr className="text-amber-600">
                           <th className="text-left px-1">Date</th>
+                          <th className="text-left px-1">Compte</th>
                           <th className="text-left px-1">Pièce</th>
                           <th className="text-left px-1">Libellé</th>
                           <th className="text-right px-1">Débit</th>
                           <th className="text-right px-1">Crédit</th>
+                          <th className="text-right px-1">Solde</th>
                         </tr>
                       </thead>
                       <tbody>
                         {csvPreview.slice(0, 15).map((e, i) => (
                           <tr key={i} className="border-t border-amber-100">
                             <td className="px-1 py-0.5">{e.date}</td>
+                            <td className="px-1 py-0.5 font-mono">{e.compte}</td>
                             <td className="px-1 py-0.5 font-mono">{e.numeroPiece}</td>
                             <td className="px-1 py-0.5 truncate max-w-[150px]">{e.libelle}</td>
                             <td className="px-1 py-0.5 text-right tabular-nums">{e.debit > 0 ? fmt(e.debit) : ""}</td>
                             <td className="px-1 py-0.5 text-right tabular-nums">{e.credit > 0 ? fmt(e.credit) : ""}</td>
+                            <td className="px-1 py-0.5 text-right tabular-nums">{e.solde ? fmt(e.solde) : ""}</td>
                           </tr>
                         ))}
                       </tbody>
@@ -433,7 +577,7 @@ export default function GrandLivreTab({ rows, setRows, ccySym, stats, planCompta
               <div className="bg-neutral-50 rounded-lg p-3 space-y-2">
                 <div className="text-xs text-neutral-500 font-medium">Format CSV attendu :</div>
                 <div className="text-[10px] font-mono text-neutral-400 bg-white rounded p-2 overflow-x-auto whitespace-nowrap border border-neutral-200">
-                  Date;Journal;NumPiece;CompteDebit;CompteCredit;Libelle;Debit;Credit;Entite
+                  DATE;Code Journal;Compte;Description;Analytic code;N° de pièce;Libellé écriture;Mouvement débit;Mouvement crédit;Solde
                 </div>
                 <button onClick={downloadTemplate}
                   className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-lg text-xs font-semibold w-full transition">
@@ -563,6 +707,7 @@ export default function GrandLivreTab({ rows, setRows, ccySym, stats, planCompta
                   {classe5Balances.map(([compte, bal]) => (
                     <div key={compte} className="bg-white rounded-lg p-2 border border-blue-100">
                       <div className="font-mono text-xs font-bold text-neutral-800">{compte}</div>
+                      {bal.description && <div className="text-[10px] text-neutral-500 truncate">{bal.description}</div>}
                       <div className={`text-sm font-black ${bal.solde >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
                         {bal.solde >= 0 ? "+" : ""}{fmt(bal.solde)} {ccySym}
                       </div>
@@ -584,24 +729,26 @@ export default function GrandLivreTab({ rows, setRows, ccySym, stats, planCompta
                   <thead>
                     <tr className="bg-neutral-50 text-neutral-500 sticky top-0">
                       <th className="px-2 py-1.5 text-left font-medium">Date</th>
+                      <th className="px-2 py-1.5 text-left font-medium">Compte</th>
+                      <th className="px-2 py-1.5 text-left font-medium">Description</th>
                       <th className="px-2 py-1.5 text-left font-medium">Pièce</th>
-                      <th className="px-2 py-1.5 text-left font-medium">Débit</th>
-                      <th className="px-2 py-1.5 text-left font-medium">Crédit</th>
                       <th className="px-2 py-1.5 text-left font-medium">Libellé</th>
-                      <th className="px-2 py-1.5 text-right font-medium">Débit</th>
-                      <th className="px-2 py-1.5 text-right font-medium">Crédit</th>
+                      <th className="px-2 py-1.5 text-right font-medium">Mvt Débit</th>
+                      <th className="px-2 py-1.5 text-right font-medium">Mvt Crédit</th>
+                      <th className="px-2 py-1.5 text-right font-medium">Solde</th>
                     </tr>
                   </thead>
                   <tbody>
                     {classe5Entries.slice(-80).reverse().map(e => (
                       <tr key={e.id} className="border-b border-neutral-100 hover:bg-neutral-50">
                         <td className="px-2 py-1">{e.date}</td>
+                        <td className="px-2 py-1 font-mono text-neutral-800">{e.compte}</td>
+                        <td className="px-2 py-1 text-neutral-500 truncate max-w-[120px]">{e.description}</td>
                         <td className="px-2 py-1 font-mono text-neutral-500">{e.numeroPiece}</td>
-                        <td className="px-2 py-1 font-mono">{e.compteDebit}</td>
-                        <td className="px-2 py-1 font-mono">{e.compteCredit}</td>
                         <td className="px-2 py-1 text-neutral-600 truncate max-w-[200px]">{e.libelle}</td>
                         <td className="px-2 py-1 text-right tabular-nums text-emerald-600">{e.debit > 0 ? fmt(e.debit) : "—"}</td>
                         <td className="px-2 py-1 text-right tabular-nums text-rose-600">{e.credit > 0 ? fmt(e.credit) : "—"}</td>
+                        <td className={`px-2 py-1 text-right tabular-nums font-medium ${(e.solde || 0) >= 0 ? "text-neutral-700" : "text-rose-600"}`}>{e.solde ? fmt(e.solde) : "—"}</td>
                       </tr>
                     ))}
                   </tbody>
